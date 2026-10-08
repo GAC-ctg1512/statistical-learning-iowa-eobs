@@ -1,0 +1,305 @@
+\documentclass[11pt,a4paper]{article}
+
+% ==============================================================================
+% PACKAGES
+% ==============================================================================
+\usepackage[a4paper,
+            top=2.3cm, bottom=2.3cm,
+            left=2.3cm, right=2.3cm,
+            headsep=12pt, footskip=12pt]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath, amssymb}
+\usepackage{siunitx}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\captionsetup{font=small, labelfont=bf}
+
+% Clean header/footer with no extra rules
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\graphicspath{{D:/SoSe 2026/MHYWI05 Statistical Learning for Earth System Sciences/Tasks for the report/Figures/}}
+
+% Tighter float spacing (this was already in your working version)
+\setlength{\textfloatsep}{6pt plus 2pt minus 2pt}
+\setlength{\floatsep}{6pt plus 2pt minus 2pt}
+\setlength{\intextsep}{6pt plus 2pt minus 2pt}
+
+% ==============================================================================
+\begin{document}
+% ==============================================================================
+
+% ------------------------------------------------------------------------------
+% TITLE PAGE
+% ------------------------------------------------------------------------------
+\pagenumbering{gobble}
+\thispagestyle{empty}
+\input{title}
+\clearpage
+
+% ------------------------------------------------------------------------------
+% MAIN BODY
+% ------------------------------------------------------------------------------
+\pagenumbering{arabic}
+\setcounter{page}{1}
+
+% ==============================================================================
+\section{Introduction}
+% ==============================================================================
+
+This report applies statistical learning methods to two environmental datasets
+with different structures and inferential goals. The first is a panel of Iowa
+crop yields (25 locations, 60 years) with monthly growing-season meteorological
+predictors; here the question is predictive, and specifically how the standard
+random train/test split compares to one that respects the data's temporal
+structure. The second is gridded European climate data over 1950--2025; here the
+question is inferential, namely how strong the long-term temperature and
+precipitation trends are and how correcting for thousands of simultaneous tests
+affects which trends survive. Both analyses turn on assumptions that are easy to
+ignore: independence of observations in the crop panel, and independence of
+tests in the climate grids.
+
+% ==============================================================================
+\section{Iowa Crop Yield Data}
+% ==============================================================================
+
+\subsection{Data and dimensionality: Answer 1a}
+
+The dataset contains $n = 1500$ observations (25 locations $\times$ 60 years) and
+$p = 23$ predictors: six monthly values each of precipitation, radiation, and
+temperature during the growing season, plus five extreme-event indicators (frost
+days, warm days, maximum and minimum temperature, and maximum 5-day
+precipitation). There are no missing values.
+
+PCA on the standardised predictors shows that \textbf{11 components are required
+to explain at least 80\% of the total variance} (81.3\% cumulative;
+Figure~\ref{fig:pca}). The scree plot shows no sharp elbow: variance declines
+gradually rather than concentrating in a few components, indicating moderate but
+not extreme redundancy among the predictors.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.95\textwidth]{fig1_pca.png}
+  \caption{Variance explained per principal component (left) and cumulative
+  variance (right), with the 80\% threshold and the 11th component marked in red.}
+  \label{fig:pca}
+\end{figure}
+
+\subsection{Violation of the i.i.d.\ assumption: Answer 1b}
+
+The data violate the independent and identically distributed assumption through
+strong cross-sectional (spatial) dependence. A representative monthly
+temperature predictor, \texttt{temp\_3}, is correlated at $r = 0.958$ across the
+25 Iowa locations within the same year, and yield itself shows a mean
+cross-location correlation of $r = 0.685$. Growing conditions are shared across
+the state, so observations from the same year are not independent draws.
+
+A fixed-effects regression confirms this: fitting yield on location and year as
+categorical factors alone, with no weather information, explains \textbf{71.8\%
+of the variance}. Temporal dependence is comparatively weak --- the mean
+within-location correlation between year and yield is $r = -0.094$ --- so the
+identical-distribution assumption is a smaller concern than independence.
+
+\subsection{Random train/test split: Answer 1c}
+
+The data were split 50/50 ($n = 750$ each) using \texttt{set.seed(99)}. Two
+models were fit: best subset regression with size chosen by minimum BIC, and
+lasso with 5-fold cross-validation. For the lasso, both $\lambda_{\min}$ and
+$\lambda_{1\mathrm{se}}$ are reported. Results are shown in Table~\ref{tab:1c}.
+
+\begin{table}[htbp]
+  \centering
+  \small
+  \begin{tabular}{l c S[table-format=1.4] S[table-format=1.4] S[table-format=1.4] S[table-format=1.4]}
+    \toprule
+    Model & Vars & {Train MSE} & {Train $R^2$} & {Test MSE} & {Test $R^2$} \\
+    \midrule
+    Best subset (BIC, $k=11$) & 11 & 2.8381 & 0.6704 & 3.2581 & 0.6343 \\
+    Lasso $\lambda_{\min}$    & 20 & 2.7716 & 0.6782 & 3.2366 & 0.6367 \\
+    Lasso $\lambda_{1\mathrm{se}}$ & 12 & 3.0566 & 0.6451 & 3.3540 & 0.6235 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Random 50/50 split ($n_{\text{train}} = n_{\text{test}} = 750$).
+  Test $R^2$ is computed against the test set's own mean.}
+  \label{tab:1c}
+\end{table}
+
+$\lambda_{1\mathrm{se}}$ retains 12 variables against $\lambda_{\min}$'s 20, at
+a cost of only ${\sim}0.013$ in test $R^2$; it is the more defensible choice for
+a report where interpretability matters.
+
+Best subset (11 variables) selected: \texttt{pr\_2, pr\_3, rad\_2, rad\_3,
+temp\_2, temp\_3, temp\_4, temp\_6, warm\_days, max\_temp, max\_5day\_pr}.
+
+Lasso at $\lambda_{1\mathrm{se}}$ (12 variables) selected a very similar set:
+\texttt{pr\_2, pr\_3, rad\_2, rad\_3, rad\_5, temp\_2, temp\_3, temp\_4,
+temp\_6, warm\_days, max\_temp, max\_5day\_pr}.
+
+The two sets differ only by \texttt{rad\_5}, which lasso includes. Test $R^2$
+for both methods lands in the 0.62--0.64 range, and the
+predicted-versus-observed plots in Figure~\ref{fig:1c} track the 1:1 line
+closely across the full yield range.
+
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig2_pred_vs_obs.png}
+  \caption{Predicted vs.\ observed yield on the test set (random split),
+  best subset (left) and lasso $\lambda_{\min}$ (right); dashed line is 1:1.}
+  \label{fig:1c}
+\end{figure}
+
+\subsection{Year-parity split and the effect of spatial leakage: Answer 1d}
+
+The models were refitted with an alternative split: even years for training, odd
+years for testing. This yields 750 observations in each set, but with no year
+appearing in both training and test data. Results are shown in
+Table~\ref{tab:1d}.
+
+\begin{table}[H]
+  \centering
+  \small
+  \begin{tabular}{l c S[table-format=1.4] S[table-format=1.4] S[table-format=1.4] S[table-format=1.4]}
+    \toprule
+    Model & Vars & {Train MSE} & {Train $R^2$} & {Test MSE} & {Test $R^2$} \\
+    \midrule
+    Best subset (BIC, $k=15$) & 15 & 2.7494 & 0.6934 & 4.5750 & 0.4648 \\
+    Lasso $\lambda_{\min}$    & 23 & 2.6839 & 0.7007 & 4.7114 & 0.4489 \\
+    Lasso $\lambda_{1\mathrm{se}}$ & 17 & 2.9036 & 0.6762 & 4.3304 & 0.4934 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Year-parity split ($n_{\text{train}} = n_{\text{test}} = 750$).}
+  \label{tab:1d}
+\end{table}
+
+Training performance is essentially unchanged; test performance drops
+substantially. Best subset test $R^2$ falls from 0.634 to 0.465, and lasso at
+$\lambda_{\min}$ falls from 0.637 to 0.449. Figure~\ref{fig:1d} shows the cause
+visually: the scatter around the 1:1 line is markedly wider, with predictions
+for high-yield observations routinely falling short by 2--4\,t/ha.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig3_pred_vs_obs_parity.png}
+  \caption{As Figure~\ref{fig:1c}, for the year-parity split. Note the wider
+  scatter around the 1:1 line.}
+  \label{fig:1d}
+\end{figure}
+
+The mechanism is the spatial dependence documented in Answer 1b. Under the
+random split, a test observation from, say, location 7 in a given year has
+training-set neighbours from other locations in the same year. Because
+temperature is correlated at $r = 0.96$ across locations within a year, those
+neighbours carry much of the information needed to predict the test point's
+yield --- the model interpolates rather than extrapolates. The year-parity split
+removes this channel: no year appears in both sets, so the model must predict
+under meteorological conditions it has never observed at any location. The
+resulting test $R^2$ of 0.45--0.49 is the honest estimate of out-of-sample
+performance.
+
+% ==============================================================================
+\section{European Climate Trends}
+% ==============================================================================
+
+\subsection{Per-cell trend analysis: Answer 2a}
+
+The gridded climate data cover the European domain from approximately
+$35^\circ$N to $75^\circ$N and $10^\circ$W to $30^\circ$E, at roughly
+$0.25^\circ$ resolution, over 76 annual timesteps from 1950 to 2025. Annual mean
+temperature ranges from $-6.98^\circ$C to $24.73^\circ$C; annual precipitation
+sums range from 0 to 4938.4\,mm. Ocean cells are masked (NA).
+
+For each land grid cell, a linear regression of the variable on year was fitted
+and the null hypothesis $H_0$: slope $= 0$ was tested against the two-sided
+alternative at $\alpha = 0.05$. This gives 11{,}791 temperature tests and
+11{,}918 precipitation tests.
+
+The strongest warming trend is $0.058^\circ$C\,yr$^{-1}$, and the strongest
+cooling trend is $-0.012^\circ$C\,yr$^{-1}$. For precipitation, the strongest
+increase is 17.1\,mm\,yr$^{-1}$ and the strongest decrease is
+$-7.8$\,mm\,yr$^{-1}$; both are isolated single cells and likely artefacts of
+the underlying interpolation over complex terrain.
+
+Of the 11{,}791 temperature cells, \textbf{11{,}512 (97.6\%)} show a
+significant trend at $\alpha = 0.05$. For precipitation, \textbf{4{,}799 of
+11{,}918 (40.3\%)} are significant. Under a global null of no trends anywhere,
+we would expect approximately 589.6 and 595.9 false positives respectively.
+Both observed counts are far above this baseline, indicating genuine widespread
+signal.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.95\textwidth]{fig4_trend_maps.png}
+  \caption{Linear trends in annual mean temperature (left, $^\circ$C/decade) and
+  annual precipitation sums (right, mm/decade) over Europe, 1950--2025. Colour
+  scales are symmetric around zero.}
+  \label{fig:trends}
+\end{figure}
+
+Figure~\ref{fig:trends} shows the spatial distribution of the raw trends.
+Warming is coherent across nearly the entire domain, with the strongest signal
+over Scandinavia, the Baltic, and Central/Eastern Europe; cooling patches appear
+only in isolated parts of the British Isles and the southeastern Balkans.
+Precipitation trends are much patchier: increases dominate in Scotland, Norway,
+and the Alps, while decreases cluster in Iberia, Italy, and the western Balkans.
+
+\subsection{Multiple testing correction: Answer 2b}
+
+The Benjamini--Hochberg procedure was applied separately to each variable's
+$p$-values, with a self-chosen false discovery rate of $q = 0.05$. This
+guarantees that, on average, no more than 5\% of the rejected null hypotheses
+are false positives.
+
+For temperature, the number of significant cells is essentially unchanged
+(11{,}512 $\rightarrow$ 11{,}510; 0.02\% reduction). For precipitation, the count
+falls from 4{,}799 to 3{,}838, a 20.0\% reduction. The expected number of false
+discoveries among the surviving rejections is $q \times$ (number of rejections):
+575.5 for temperature and 191.9 for precipitation.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.95\textwidth]{fig5_fdr_maps.png}
+  \caption{Grid cells with a statistically significant trend after
+  Benjamini--Hochberg correction ($q = 0.05$).}
+  \label{fig:fdr}
+\end{figure}
+
+After correction, the spatial patterns remain largely intact: temperature
+warming is still near-ubiquitous, and precipitation retains its regional
+structure (wetter across Scandinavia, drier across Iberia and the western
+Mediterranean). The divergence in correction behaviour reflects a real
+difference in signal-to-noise ratio. Temperature trends are large relative to
+year-to-year variability and spatially coherent, so almost every raw-significant
+cell corresponds to a genuine trend. Precipitation trends are smaller relative
+to interannual variability and spatially patchier, so a meaningful fraction of
+the raw-significant cells were likely noise --- which the FDR correction removes.
+
+% ==============================================================================
+\section{Conclusion}
+% ==============================================================================
+
+Both analyses make the same methodological point from different directions: the
+assumptions underlying standard statistical learning procedures are frequently
+violated by Earth system data, and the consequences show up in the results. In
+the Iowa crop panel, ignoring spatial dependence via a random split yields a
+test $R^2$ of 0.63--0.64; respecting it via a year-parity split yields
+0.45--0.49. The 0.13--0.19 gap in $R^2$ is the cost of the random split's
+implicit information leakage, and it would not survive in operational
+forecasting, where future years are genuinely unseen. In the European climate
+grids, failing to correct for multiple testing inflates the count of significant
+trends by roughly 20\% for precipitation, while barely affecting temperature,
+since the two variables differ in signal-to-noise ratio. In both cases, checking
+whether the data's structure is compatible with the method's assumptions --- and
+choosing the variant that accounts for that structure explicitly --- is what
+makes the reported performance and significance estimates trustworthy.
+
+% ==============================================================================
+\end{document}
+% ==============================================================================

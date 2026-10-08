@@ -1,0 +1,405 @@
+# ==============================================================================
+# MHYWI05 -- Statistical Learning for Earth System Sciences
+# Report code: Crop yield (Iowa.RData) + European climate (temperature.nc,
+#              precipitation.nc)
+# ==============================================================================
+
+# --- Session hygiene: cleaning slate every run ----------------------------------
+while (dev.cur() > 1) dev.off()   # close any lingering graphics devices
+rm(list = ls())                   # clear stale objects
+gc()                              # free memory
+
+# --- Setup -------------------------------------------------------------------
+if (!requireNamespace("ncdf4", quietly = TRUE)) install.packages("ncdf4")
+
+setwd("D:/SoSe 2026/MHYWI05 Statistical Learning for Earth System Sciences/Tasks for the report")
+
+suppressPackageStartupMessages({
+  library(ncdf4)
+  library(leaps)
+  library(glmnet)
+  library(fields)
+  library(rworldmap)
+})
+
+mse <- function(obs, pred) mean((obs - pred)^2)
+r2  <- function(obs, pred) 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+
+# ==============================================================================
+# PART 0 -- DIAGNOSTICS
+# ==============================================================================
+cat("\n========== DIAGNOSTICS ==========\n")
+
+load("Iowa.RData")
+loaded <- ls()
+cat("Objects after load:", paste(loaded, collapse = ", "), "\n")
+df_names <- loaded[sapply(loaded, function(o) is.data.frame(get(o)))]
+if (length(df_names) == 0) stop("No data.frame found in Iowa.RData")
+if (length(df_names) > 1) warning("Multiple data frames: ", paste(df_names, collapse = ", "))
+crops <- get(df_names[1])
+
+cat("Iowa: dim =", paste(dim(crops), collapse = " x "), "\n")
+cat("Iowa columns:", paste(names(crops), collapse = ", "), "\n")
+cat("NA count:", sum(is.na(crops)), "\n")
+stopifnot(all(c("yield", "loc", "year") %in% names(crops)))
+
+predictor_names <- setdiff(names(crops), c("yield", "loc", "year"))
+n <- nrow(crops); p <- length(predictor_names)
+cat("n =", n, "| p =", p, "\n")
+
+nc_t <- nc_open("temperature.nc")
+tg   <- ncvar_get(nc_t, "tg")
+lon  <- ncvar_get(nc_t, "longitude")
+lat  <- ncvar_get(nc_t, "latitude")
+nc_close(nc_t)
+
+nc_p <- nc_open("precipitation.nc")
+rr   <- ncvar_get(nc_p, "rr")
+nc_close(nc_p)
+
+nt <- dim(tg)[3]
+if (nt != dim(rr)[3]) stop("tg and rr have different time dimensions")
+years <- seq(1950, 1950 + nt - 1)
+cat("Time steps:", nt, "-> years", years[1], "to", years[nt], "\n")
+cat("========== END DIAGNOSTICS ==========\n\n")
+
+# ==============================================================================
+# PART 1 -- CROP YIELD
+# ==============================================================================
+
+# ------- 1a: PCA -------------------------------------------------------------
+cat("\n---------- 1a ----------\n")
+X <- as.matrix(crops[, predictor_names])
+stopifnot(sum(is.na(X)) == 0)
+
+pca     <- prcomp(X, scale. = TRUE)
+pve     <- pca$sdev^2 / sum(pca$sdev^2)
+cum_pve <- cumsum(pve)
+n80     <- which(cum_pve >= 0.80)[1]
+
+cat("PCs for >=80% variance:", n80,
+    " (cumulative =", round(100 * cum_pve[n80], 1), "%)\n")
+
+png("fig1_pca.png", width = 2000, height = 900, res = 200)
+par(mfrow = c(1, 2))
+plot(pve, type = "b", pch = 19, xlab = "Principal component",
+     ylab = "Proportion of variance explained", main = "Variance per PC")
+plot(cum_pve, type = "b", pch = 19, xlab = "Principal component",
+     ylab = "Cumulative proportion of variance explained", main = "Cumulative variance")
+abline(h = 0.80, col = "red", lty = 2)
+abline(v = n80, col = "red", lty = 2)
+points(n80, cum_pve[n80], col = "red", pch = 19, cex = 1.4)
+dev.off()
+
+# ------- 1b: i.i.d. check ----------------------------------------------------
+cat("\n---------- 1b ----------\n")
+
+cor_within <- sapply(sort(unique(crops$loc)), function(l) {
+  idx <- crops$loc == l
+  cor(crops$year[idx], crops$yield[idx])
+})
+cat("Mean within-location cor(year, yield):",
+    round(mean(cor_within, na.rm = TRUE), 3), "\n")
+
+to_wide <- function(var) {
+  if (!var %in% names(crops)) return(NULL)
+  yrs <- sort(unique(crops$year)); locs <- sort(unique(crops$loc))
+  m <- matrix(NA, length(yrs), length(locs))
+  for (i in seq_len(nrow(crops)))
+    m[match(crops$year[i], yrs), match(crops$loc[i], locs)] <- crops[[var]][i]
+  m
+}
+temp_var <- intersect(c("temp_3", "t_3", "temp3"), names(crops))[1]
+if (!is.na(temp_var)) {
+  m <- to_wide(temp_var); cc <- cor(m, use = "pairwise.complete.obs")
+  cat("Mean cross-location cor,", temp_var, ":",
+      round(mean(cc[upper.tri(cc)], na.rm = TRUE), 3), "\n")
+}
+m_y <- to_wide("yield"); cc_y <- cor(m_y, use = "pairwise.complete.obs")
+cat("Mean cross-location cor, yield:",
+    round(mean(cc_y[upper.tri(cc_y)], na.rm = TRUE), 3), "\n")
+
+fit_fe <- lm(yield ~ factor(loc) + factor(year), data = crops)
+cat("R^2 (yield ~ loc + year, no weather):",
+    round(summary(fit_fe)$r.squared, 3), "\n")
+
+# ------- Shared model fitting function ---------------------------------------
+fit_models <- function(train, test, predictor_names, tag) {
+  form <- as.formula(paste("yield ~", paste(predictor_names, collapse = " + ")))
+  
+  bs <- regsubsets(form, data = train,
+                   nvmax = length(predictor_names), method = "exhaustive")
+  bs_sum  <- summary(bs)
+  k_bic   <- which.min(bs_sum$bic)
+  bs_vars <- names(coef(bs, k_bic))[-1]
+  bs_lm   <- lm(reformulate(bs_vars, "yield"), data = train)
+  
+  bs_ptr <- predict(bs_lm, newdata = train)
+  bs_pte <- predict(bs_lm, newdata = test)
+  
+  Xtr <- as.matrix(train[, predictor_names])
+  Xte <- as.matrix(test[,  predictor_names])
+  set.seed(99)
+  cvl <- cv.glmnet(Xtr, train$yield, alpha = 1, nfolds = 5)
+  
+  res <- list(tag = tag, k_bic = k_bic, bs_vars = bs_vars,
+              bs = list(
+                train_mse = mse(train$yield, bs_ptr),
+                train_r2  = r2 (train$yield, bs_ptr),
+                test_mse  = mse(test$yield,  bs_pte),
+                test_r2   = r2 (test$yield,  bs_pte),
+                pred_test = bs_pte),
+              yte = test$yield)
+  
+  for (s in c("lambda.min", "lambda.1se")) {
+    co   <- coef(cvl, s = s)
+    vars <- setdiff(rownames(co)[which(co[, 1] != 0)], "(Intercept)")
+    p_tr <- as.numeric(predict(cvl, newx = Xtr, s = s))
+    p_te <- as.numeric(predict(cvl, newx = Xte, s = s))
+    res$lasso[[s]] <- list(
+      vars = vars,
+      train_mse = mse(train$yield, p_tr), train_r2 = r2(train$yield, p_tr),
+      test_mse  = mse(test$yield,  p_te), test_r2  = r2(test$yield,  p_te),
+      pred_test = p_te)
+  }
+  res
+}
+
+report <- function(res) {
+  cat("\n===", res$tag, "===\n")
+  cat(sprintf("Best subset (BIC, k = %d): %s\n",
+              res$k_bic, paste(res$bs_vars, collapse = ", ")))
+  cat(sprintf("  Train: MSE = %.4f  R2 = %.4f\n",
+              res$bs$train_mse, res$bs$train_r2))
+  cat(sprintf("  Test : MSE = %.4f  R2 = %.4f\n",
+              res$bs$test_mse, res$bs$test_r2))
+  for (s in c("lambda.min", "lambda.1se")) {
+    l <- res$lasso[[s]]
+    cat(sprintf("Lasso (%s): %d vars = %s\n",
+                s, length(l$vars), paste(l$vars, collapse = ", ")))
+    cat(sprintf("  Train: MSE = %.4f  R2 = %.4f\n", l$train_mse, l$train_r2))
+    cat(sprintf("  Test : MSE = %.4f  R2 = %.4f\n", l$test_mse,  l$test_r2))
+  }
+}
+
+# ------- 1c: random 50/50 split (seed = 99) ----------------------------------
+cat("\n---------- 1c: random 50/50 split, seed = 99 ----------\n")
+set.seed(99)
+idx_train <- sample(seq_len(n), size = n / 2)
+train_c <- crops[ idx_train, ]
+test_c  <- crops[-idx_train, ]
+cat("Train n =", nrow(train_c), "| Test n =", nrow(test_c), "\n")
+
+res_1c <- fit_models(train_c, test_c, predictor_names, "1c random split")
+report(res_1c)
+
+png("fig2_pred_vs_obs.png", width = 1600, height = 800, res = 160)
+par(mfrow = c(1, 2))
+plot(res_1c$yte, res_1c$bs$pred_test, pch = 19, col = "steelblue",
+     xlab = "Observed yield", ylab = "Predicted yield",
+     main = "1c: Best subset (test set)")
+abline(0, 1, col = "red", lty = 2)
+plot(res_1c$yte, res_1c$lasso$lambda.min$pred_test, pch = 19, col = "darkgreen",
+     xlab = "Observed yield", ylab = "Predicted yield",
+     main = "1c: Lasso lambda.min (test set)")
+abline(0, 1, col = "red", lty = 2)
+dev.off()
+
+# ------- 1d: year-parity split -----------------------------------------------
+cat("\n---------- 1d: year-parity split ----------\n")
+train_p <- crops[crops$year %% 2 == 0, ]
+test_p  <- crops[crops$year %% 2 != 0, ]
+cat("Train n =", nrow(train_p), "| Test n =", nrow(test_p), "\n")
+
+res_1d <- fit_models(train_p, test_p, predictor_names, "1d parity split")
+report(res_1d)
+
+png("fig3_pred_vs_obs_parity.png", width = 1600, height = 800, res = 160)
+par(mfrow = c(1, 2))
+plot(res_1d$yte, res_1d$bs$pred_test, pch = 19, col = "steelblue",
+     xlab = "Observed yield", ylab = "Predicted yield",
+     main = "1d: Best subset (test set)")
+abline(0, 1, col = "red", lty = 2)
+plot(res_1d$yte, res_1d$lasso$lambda.min$pred_test, pch = 19, col = "darkgreen",
+     xlab = "Observed yield", ylab = "Predicted yield",
+     main = "1d: Lasso lambda.min (test set)")
+abline(0, 1, col = "red", lty = 2)
+dev.off()
+
+cat("\n---------- 1c vs 1d (test R^2) ----------\n")
+cat(sprintf("Random | Best subset: %.3f | Lasso.min: %.3f\n",
+            res_1c$bs$test_r2, res_1c$lasso$lambda.min$test_r2))
+cat(sprintf("Parity | Best subset: %.3f | Lasso.min: %.3f\n",
+            res_1d$bs$test_r2, res_1d$lasso$lambda.min$test_r2))
+
+# ==============================================================================
+# PART 2 -- CLIMATE
+# ==============================================================================
+
+# ------- 2a: trends ----------------------------------------------------------
+cat("\n---------- 2a ----------\n")
+cat("Temperature range (deg C):", round(range(tg, na.rm = TRUE), 2), "\n")
+cat("Precipitation range (mm): ", round(range(rr, na.rm = TRUE), 2), "\n")
+
+trend_grid <- function(arr, yrs) {
+  d <- dim(arr); m <- d[1] * d[2]
+  Y <- matrix(arr, nrow = m)
+  ok <- rowSums(!is.na(Y)) == length(yrs)
+  slope <- rep(NA_real_, m); pval <- rep(NA_real_, m)
+  if (any(ok)) {
+    Yk <- Y[ok, , drop = FALSE]
+    x  <- yrs - mean(yrs); Sxx <- sum(x^2)
+    b  <- as.vector((Yk - rowMeans(Yk)) %*% x) / Sxx
+    a  <- rowMeans(Yk) - b * mean(yrs)
+    resid  <- Yk - (a + outer(b, yrs))
+    sigma2 <- rowSums(resid^2) / (length(yrs) - 2)
+    se <- sqrt(sigma2 / Sxx)
+    t  <- b / se
+    p  <- 2 * pt(-abs(t), df = length(yrs) - 2)
+    slope[ok] <- b; pval[ok] <- p
+  }
+  list(slope = matrix(slope, d[1], d[2]),
+       pval  = matrix(pval,  d[1], d[2]))
+}
+
+tr_t <- trend_grid(tg, years)
+tr_p <- trend_grid(rr, years)
+
+alpha <- 0.05
+n_t   <- sum(!is.na(tr_t$pval));  n_p <- sum(!is.na(tr_p$pval))
+sig_t <- sum(tr_t$pval < alpha, na.rm = TRUE)
+sig_p <- sum(tr_p$pval < alpha, na.rm = TRUE)
+
+cat("Cells tested  : temp =", n_t, " precip =", n_p, "\n")
+cat("Strongest warming:", round(max(tr_t$slope, na.rm = TRUE), 4), "C/yr",
+    "| strongest cooling:", round(min(tr_t$slope, na.rm = TRUE), 4), "C/yr\n")
+cat("Strongest wettening:", round(max(tr_p$slope, na.rm = TRUE), 4), "mm/yr",
+    "| strongest drying:",  round(min(tr_p$slope, na.rm = TRUE), 4), "mm/yr\n")
+cat("Significant (alpha=0.05): temp =", sig_t, "/", n_t,
+    " precip =", sig_p, "/", n_p, "\n")
+cat("Expected false positives under global null:",
+    "temp ~", round(alpha * n_t, 1),
+    "| precip ~", round(alpha * n_p, 1), "\n")
+
+# ------- 2b: FDR correction (Benjamini-Hochberg) -----------------------------
+cat("\n---------- 2b: FDR correction (Benjamini-Hochberg) ----------\n")
+q <- 0.05
+
+padj_grid <- function(pmat, q) {
+  v <- as.vector(pmat); ok <- !is.na(v)
+  a <- rep(NA_real_, length(v))
+  a[ok] <- p.adjust(v[ok], method = "BH")
+  list(mat = matrix(a, nrow(pmat)), sig = sum(a < q, na.rm = TRUE))
+}
+fdr_t <- padj_grid(tr_t$pval, q)
+fdr_p <- padj_grid(tr_p$pval, q)
+
+sig_t_fdr <- fdr_t$sig
+sig_p_fdr <- fdr_p$sig
+
+cat("q =", q, "\n")
+cat("Temp  : raw =", sig_t, "-> FDR =", sig_t_fdr,
+    "(", round(100*(sig_t - sig_t_fdr)/sig_t, 1), "% removed )\n")
+cat("Precip: raw =", sig_p, "-> FDR =", sig_p_fdr,
+    "(", round(100*(sig_p - sig_p_fdr)/sig_p, 1), "% removed )\n")
+cat("Expected false discoveries among FDR rejections:",
+    "temp =", round(q * sig_t_fdr, 1),
+    "| precip =", round(q * sig_p_fdr, 1), "\n")
+
+# ------- Colour limits for maps ----------------------------------------------
+lim_t <- max(abs(tr_t$slope * 10), na.rm = TRUE)
+cat("Temperature colour limit (C/decade):", round(lim_t, 3), "\n")
+
+lim_p <- quantile(abs(tr_p$slope * 10), 0.95, na.rm = TRUE)
+cat("Precipitation colour limit (mm/decade, 95th pct):", round(lim_p, 2), "\n")
+
+# ------- Figure 4: raw trends ------------------------------------------------
+png("fig4_trend_maps.png", width = 2400, height = 1000, res = 180)
+par(mfrow = c(1, 2))
+
+image.plot(lon, lat, tr_t$slope * 10,
+           zlim = c(-lim_t, lim_t),
+           col  = colorRampPalette(c("blue", "white", "red"))(60),
+           main = "Temperature trend (C/decade)",
+           xlab = "Longitude", ylab = "Latitude")
+plot(coastsCoarse, add = TRUE)
+
+image.plot(lon, lat, tr_p$slope * 10,
+           zlim = c(-lim_p, lim_p),
+           col  = colorRampPalette(c("#8B4513", "white", "darkgreen"))(60),
+           main = "Precipitation trend (mm/decade)",
+           xlab = "Longitude", ylab = "Latitude")
+plot(coastsCoarse, add = TRUE)
+
+dev.off()
+
+# ------- Figure 5: FDR-significant trends ------------------------------------
+png("fig5_fdr_maps.png", width = 2400, height = 1000, res = 180)
+par(mfrow = c(1, 2))
+
+sl_t <- tr_t$slope
+sl_t[fdr_t$mat >= q | is.na(fdr_t$mat)] <- NA
+
+sl_p <- tr_p$slope
+sl_p[fdr_p$mat >= q | is.na(fdr_p$mat)] <- NA
+
+image.plot(lon, lat, sl_t * 10,
+           zlim = c(-lim_t, lim_t),
+           col  = colorRampPalette(c("blue", "white", "red"))(60),
+           main = paste0("Significant temperature trends (FDR q = ", q, ")"),
+           xlab = "Longitude", ylab = "Latitude")
+plot(coastsCoarse, add = TRUE)
+
+image.plot(lon, lat, sl_p * 10,
+           zlim = c(-lim_p, lim_p),
+           col  = colorRampPalette(c("#8B4513", "white", "darkgreen"))(60),
+           main = paste0("Significant precipitation trends (FDR q = ", q, ")"),
+           xlab = "Longitude", ylab = "Latitude")
+plot(coastsCoarse, add = TRUE)
+
+dev.off()
+
+# ==============================================================================
+# FINAL SUMMARY
+# ==============================================================================
+cat("\n\n=================== SUMMARY FOR REPORT ===================\n")
+cat("Crop yield data: n =", n, "| p =", p, "\n")
+cat("PCs for >=80% variance:", n80,
+    "(", round(100 * cum_pve[n80], 1), "% )\n\n")
+
+cat("1c random split -- best subset (k =", res_1c$k_bic, "):\n")
+cat("   train MSE =", round(res_1c$bs$train_mse, 4),
+    "| test MSE =", round(res_1c$bs$test_mse, 4),
+    "| train R2 =", round(res_1c$bs$train_r2, 4),
+    "| test R2 =", round(res_1c$bs$test_r2, 4), "\n")
+cat("1c random split -- lasso lambda.min (", length(res_1c$lasso$lambda.min$vars), "vars ):\n")
+cat("   train MSE =", round(res_1c$lasso$lambda.min$train_mse, 4),
+    "| test MSE =", round(res_1c$lasso$lambda.min$test_mse, 4),
+    "| train R2 =", round(res_1c$lasso$lambda.min$train_r2, 4),
+    "| test R2 =", round(res_1c$lasso$lambda.min$test_r2, 4), "\n\n")
+
+cat("1d parity split -- best subset (k =", res_1d$k_bic, "):\n")
+cat("   train MSE =", round(res_1d$bs$train_mse, 4),
+    "| test MSE =", round(res_1d$bs$test_mse, 4),
+    "| train R2 =", round(res_1d$bs$train_r2, 4),
+    "| test R2 =", round(res_1d$bs$test_r2, 4), "\n")
+cat("1d parity split -- lasso lambda.min (", length(res_1d$lasso$lambda.min$vars), "vars ):\n")
+cat("   train MSE =", round(res_1d$lasso$lambda.min$train_mse, 4),
+    "| test MSE =", round(res_1d$lasso$lambda.min$test_mse, 4),
+    "| train R2 =", round(res_1d$lasso$lambda.min$train_r2, 4),
+    "| test R2 =", round(res_1d$lasso$lambda.min$test_r2, 4), "\n\n")
+
+cat("2a climate: temp range =", paste(round(range(tg, na.rm = TRUE), 2), collapse = " to "),
+    "C | precip range =", paste(round(range(rr, na.rm = TRUE), 2), collapse = " to "), "mm\n")
+cat("2a significant trends: temp =", sig_t, "/", n_t, "| precip =", sig_p, "/", n_p, "\n")
+cat("2a expected FPs under global null: temp ~", round(alpha * n_t, 1),
+    "| precip ~", round(alpha * n_p, 1), "\n\n")
+
+cat("2b FDR q =", q, ":\n")
+cat("   temp:   raw =", sig_t, "-> FDR =", sig_t_fdr,
+    "(", round(100*(sig_t - sig_t_fdr)/sig_t, 1), "% removed )\n")
+cat("   precip: raw =", sig_p, "-> FDR =", sig_p_fdr,
+    "(", round(100*(sig_p - sig_p_fdr)/sig_p, 1), "% removed )\n")
+cat("   expected false discoveries: temp =", round(q * sig_t_fdr, 1),
+    "| precip =", round(q * sig_p_fdr, 1), "\n")
+cat("==========================================================\n")
